@@ -37,7 +37,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -1400,6 +1400,10 @@ class SmartMoneyAlgoProE5:
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
         self.isb_history: List[bool] = []
+        self._last_choch_timestamp: Optional[int] = None
+        self._last_choch_direction: Optional[str] = None
+        self._last_choch_price: Optional[float] = None
+        self._choch_alerted_zone_ids: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1650,6 +1654,11 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "source": "confirmed",
         }
+        if key == "CHOCH":
+            self._last_choch_timestamp = timestamp
+            self._last_choch_direction = "bullish" if bullish else "bearish"
+            self._last_choch_price = price
+            self._choch_alerted_zone_ids.clear()
 
     def _output_enabled_for(self, key: str) -> bool:
         mapping = {
@@ -1715,6 +1724,8 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+            if status_key in ("touched", "retest"):
+                self._handle_choch_retracement_alert(key, status_key, ts, box)
             if status_key == "new":
                 alert_titles = {
                     "IDM_OB": "IDM OB Zone Created",
@@ -1726,6 +1737,42 @@ class SmartMoneyAlgoProE5:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created, Range: {price_range}"
                     self.alertcondition(True, alert_title, message)
+
+    def _handle_choch_retracement_alert(
+        self,
+        zone_key: str,
+        status: str,
+        timestamp: int,
+        box: Box,
+    ) -> None:
+        if self._last_choch_timestamp is None:
+            return
+        if timestamp < self._last_choch_timestamp:
+            return
+        zone_identifier = f"{zone_key}:{id(box)}"
+        if zone_identifier in self._choch_alerted_zone_ids:
+            return
+        self._choch_alerted_zone_ids.add(zone_identifier)
+        direction = self._last_choch_direction or "neutral"
+        direction_text = "صاعد" if direction == "bullish" else "هابط" if direction == "bearish" else "محايد"
+        zone_display_map = {
+            "IDM_OB": "IDM OB",
+            "EXT_OB": "EXT OB",
+            "HIST_IDM_OB": "Hist IDM OB",
+            "HIST_EXT_OB": "Hist EXT OB",
+            "GOLDEN_ZONE": "Golden zone",
+        }
+        zone_display = zone_display_map.get(zone_key, box.text)
+        price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+        choch_time = format_timestamp(self._last_choch_timestamp)
+        choch_price = format_price(self._last_choch_price)
+        title = f"CHOCH Retracement → {zone_display}"
+        message = (
+            f"{{ticker}} تصحيح CHOCH {direction_text} إلى {zone_display}. "
+            f"الحالة: {self.BOX_STATUS_LABELS.get(status, status)}. "
+            f"النطاق: {price_range}. سعر CHOCH: {choch_price}. وقت CHOCH: {choch_time}"
+        )
+        self.alertcondition(True, title, message)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
