@@ -108,6 +108,25 @@ ANSI_HEADER_COLORS = [
 
 
 @dataclass(frozen=True)
+class OutputSettings:
+    """Global switches that control which runtime outputs remain active."""
+
+    show_idm_ob: bool = True
+    show_hist_idm_ob: bool = True
+    show_ext_ob: bool = True
+    show_hist_ext_ob: bool = True
+    show_golden_zone: bool = True
+    enable_new_events: bool = True
+    enable_touched_events: bool = True
+    enable_retest_events: bool = True
+    enable_archived_events: bool = True
+    enable_active_events: bool = True
+
+
+OUTPUT_SETTINGS = OutputSettings()
+
+
+@dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
@@ -759,9 +778,15 @@ class OrderBlockInputs:
     clrtxtextbeariem: str = "color.red"
     showPOI: bool = True
     poi_type: str = "Mother Bar"
-    colorSupply: str = "#cd5c4800"
-    colorDemand: str = "#2f825f00"
-    colorMitigated: str = "#c0c0c000"
+    colorSupply: str = "#1e90ff26"
+    colorDemand: str = "#1e90ff26"
+    colorMitigated: str = "#ffd54f66"
+    new_zone_bg: str = "#1e90ff66"
+    new_zone_border: str = "#1e90ff"
+    new_zone_text: str = "#0a2a66"
+    touched_zone_bg: str = "#ffd54f66"
+    touched_zone_border: str = "#ffb300"
+    touched_zone_text: str = "#4a3600"
     showSCOB: bool = True
     scobUp: str = "#0b3ff9"
     scobDn: str = "#da781d"
@@ -896,7 +921,12 @@ class StructureInputs:
     isOTE: bool = False
     ote1: float = 0.78
     ote2: float = 0.61
-    oteclr: str = "#ff95002b"
+    oteclr: str = "#1e90ff66"
+    ote_border: str = "#1e90ff"
+    ote_text_color: str = "#0a2a66"
+    ote_touched: str = "#ffd54f66"
+    ote_touched_border: str = "#ffb300"
+    ote_touched_text_color: str = "#4a3600"
     sizGd: str = "size.normal"
     showPdh: bool = False
     lengPdh: int = 40
@@ -1621,6 +1651,30 @@ class SmartMoneyAlgoProE5:
             "source": "confirmed",
         }
 
+    def _output_enabled_for(self, key: str) -> bool:
+        mapping = {
+            "IDM_OB": "show_idm_ob",
+            "HIST_IDM_OB": "show_hist_idm_ob",
+            "EXT_OB": "show_ext_ob",
+            "HIST_EXT_OB": "show_hist_ext_ob",
+            "GOLDEN_ZONE": "show_golden_zone",
+        }
+        setting = mapping.get(key)
+        if setting is None:
+            return True
+        return getattr(OUTPUT_SETTINGS, setting, True)
+
+    def _box_status_enabled(self, status: str) -> bool:
+        status_key = status or "active"
+        if status_key == "new":
+            return OUTPUT_SETTINGS.enable_new_events
+        if status_key in ("touched", "retest"):
+            target = OUTPUT_SETTINGS.enable_touched_events if status_key == "touched" else OUTPUT_SETTINGS.enable_retest_events
+            return target
+        if status_key == "archived":
+            return OUTPUT_SETTINGS.enable_archived_events
+        return OUTPUT_SETTINGS.enable_active_events
+
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
         key: Optional[str] = None
@@ -1635,6 +1689,8 @@ class SmartMoneyAlgoProE5:
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
         if key:
+            if not self._output_enabled_for(key) or not self._box_status_enabled(status):
+                return
             ts = event_time if isinstance(event_time, int) else box.left
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
@@ -1674,6 +1730,8 @@ class SmartMoneyAlgoProE5:
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
         for key, value in self.console_event_log.items():
+            if not self._output_enabled_for(key):
+                continue
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
@@ -1686,6 +1744,8 @@ class SmartMoneyAlgoProE5:
             predicate: Callable[[Label], bool],
             formatter: Optional[Callable[[Label], str]] = None,
         ) -> None:
+            if not self._output_enabled_for(key):
+                return
             for lbl in reversed(self.labels):
                 if not isinstance(lbl, Label):
                     continue
@@ -1707,6 +1767,8 @@ class SmartMoneyAlgoProE5:
             predicate: Callable[[Box], bool],
             sources: Optional[Sequence[Iterable[Box]]] = None,
         ) -> None:
+            if not self._output_enabled_for(key):
+                return
             iterables = sources or (self.boxes,)
             for source in iterables:
                 if isinstance(source, PineArray):
@@ -2407,6 +2469,7 @@ class SmartMoneyAlgoProE5:
 
         self.transp = "color.new(color.gray,100)"
         self.bxf: Optional[Box] = None
+        self.bxf_touched: bool = False
         self.bxty = 0
         self.prev_oi1: float = NA
 
@@ -6175,8 +6238,9 @@ class SmartMoneyAlgoProE5:
                 if self.inputs.order_block.showIdmob:
                     zone = self.demandZone.get(idx)
                     zone.set_text("IDM OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
-                    zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
+                    zone.set_text_color(self.inputs.order_block.new_zone_text)
+                    zone.set_bgcolor(self.inputs.order_block.new_zone_bg)
+                    zone.set_border_color(self.inputs.order_block.new_zone_border)
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
@@ -6201,8 +6265,9 @@ class SmartMoneyAlgoProE5:
                 if self.inputs.order_block.showIdmob:
                     zone = self.supplyZone.get(idx)
                     zone.set_text("IDM OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
-                    zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
+                    zone.set_text_color(self.inputs.order_block.new_zone_text)
+                    zone.set_bgcolor(self.inputs.order_block.new_zone_bg)
+                    zone.set_border_color(self.inputs.order_block.new_zone_border)
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
@@ -6258,8 +6323,9 @@ class SmartMoneyAlgoProE5:
                 if self.inputs.order_block.showExob:
                     zone = self.demandZone.get(idx)
                     zone.set_text("EXT OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbull)
-                    zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
+                    zone.set_text_color(self.inputs.order_block.new_zone_text)
+                    zone.set_bgcolor(self.inputs.order_block.new_zone_bg)
+                    zone.set_border_color(self.inputs.order_block.new_zone_border)
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
@@ -6284,8 +6350,9 @@ class SmartMoneyAlgoProE5:
                 if self.inputs.order_block.showExob:
                     zone = self.supplyZone.get(idx)
                     zone.set_text("EXT OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbear)
-                    zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
+                    zone.set_text_color(self.inputs.order_block.new_zone_text)
+                    zone.set_bgcolor(self.inputs.order_block.new_zone_bg)
+                    zone.set_border_color(self.inputs.order_block.new_zone_border)
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
@@ -6623,19 +6690,24 @@ class SmartMoneyAlgoProE5:
                     else:
                         self.arrmitOBBear.unshift(zone)
                         self.arrmitOBBeara.unshift(False)
+                touched_bg = self.inputs.order_block.touched_zone_bg or self.inputs.order_block.colorMitigated
+                touched_border = self.inputs.order_block.touched_zone_border or self.inputs.order_block.colorMitigated
+                touched_text = self.inputs.order_block.touched_zone_text or zone.text_color
                 if isSupply:
                     if zonesmit.get(i) == 1:
                         isAlertextidm = True
                     if zonesmit.get(i) != 1:
-                        zone.set_bgcolor(self.inputs.order_block.colorMitigated)
-                        zone.set_border_color(self.inputs.order_block.colorMitigated)
+                        zone.set_bgcolor(touched_bg)
+                        zone.set_border_color(touched_border)
+                        zone.set_text_color(touched_text)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
                 else:
                     if zonesmit.get(i) == 1:
                         isAlertextidm = True
                     if zonesmit.get(i) != 1:
-                        zone.set_bgcolor(self.inputs.order_block.colorMitigated)
-                        zone.set_border_color(self.inputs.order_block.colorMitigated)
+                        zone.set_bgcolor(touched_bg)
+                        zone.set_border_color(touched_border)
+                        zone.set_text_color(touched_text)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
                 status = "retest" if prev_state == 1 else "touched"
                 self._register_box_event(zone, status=status, event_time=self.series.get_time())
@@ -7100,6 +7172,16 @@ class SmartMoneyAlgoProE5:
         self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
         self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
 
+        if self.bxf and not self.bxf_touched:
+            top_zone = self.bxf.top
+            bottom_zone = self.bxf.bottom
+            if not (high < bottom_zone or low > top_zone):
+                self.bxf.set_bgcolor(self.inputs.structure_util.ote_touched)
+                self.bxf.set_border_color(self.inputs.structure_util.ote_touched_border)
+                self.bxf.set_text_color(self.inputs.structure_util.ote_touched_text_color)
+                self._register_box_event(self.bxf, status="touched", event_time=time_val)
+                self.bxf_touched = True
+
         # POI sweeps ---------------------------------------------------------
         if self.inputs.order_block.showPOI and self.series.length() > 4:
             if not self.isSweepOBS:
@@ -7218,9 +7300,11 @@ class SmartMoneyAlgoProE5:
                 top_val = ot if not math.isnan(ot) else self.series.get("high")
                 bot_val = ob if not math.isnan(ob) else self.series.get("low")
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
+                self.bxf.set_border_color(self.inputs.structure_util.ote_border)
                 self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.oteclr)
+                self.bxf.set_text_color(self.inputs.structure_util.ote_text_color)
                 self._register_box_event(self.bxf, status="new")
+                self.bxf_touched = False
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
