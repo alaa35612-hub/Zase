@@ -72,6 +72,22 @@ ANSI_VALUE_NEG = "\033[91m"
 ANSI_SYMBOL = ANSI_VALUE_POS
 ANSI_ALERT_BULL = ANSI_VALUE_POS
 ANSI_ALERT_BEAR = ANSI_VALUE_NEG
+ANSI_ZONE_NEW = "\033[94m"
+ANSI_ZONE_TOUCHED = "\033[93m"
+
+ZONE_EVENT_KEYS = frozenset({
+    "IDM_OB",
+    "EXT_OB",
+    "HIST_IDM_OB",
+    "HIST_EXT_OB",
+    "GOLDEN_ZONE",
+})
+
+ZONE_STATUS_COLORS = {
+    "new": ANSI_ZONE_NEW,
+    "touched": ANSI_ZONE_TOUCHED,
+    "retest": ANSI_ZONE_TOUCHED,
+}
 
 ALERT_BULLISH_KEYWORDS = (
     "bull",
@@ -250,6 +266,17 @@ def _colorize_directional_text(
     if color:
         return f"{color}{base}{ANSI_RESET}"
     return base
+
+
+def _zone_status_fallback_color(key: str, event: Any) -> Optional[str]:
+    if key not in ZONE_EVENT_KEYS:
+        return None
+    if not isinstance(event, dict):
+        return None
+    status = event.get("status")
+    if isinstance(status, str):
+        return ZONE_STATUS_COLORS.get(status)
+    return None
 
 
 def _format_symbol(symbol: str) -> str:
@@ -1782,7 +1809,8 @@ class SmartMoneyAlgoProE5:
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
+            allow_stale = key in ZONE_EVENT_KEYS and isinstance(payload.get("status"), str)
+            if not allow_stale and not self._console_event_within_age(payload.get("time")):
                 continue
             events[key] = payload
 
@@ -1827,7 +1855,7 @@ class SmartMoneyAlgoProE5:
                 for bx in reversed(seq):
                     if not isinstance(bx, Box):
                         continue
-                    if not self._console_event_within_age(bx.left):
+                    if key not in ZONE_EVENT_KEYS and not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
                         events[key] = {
@@ -8800,10 +8828,11 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
                 event.get("text"),
                 display_text,
             )
+            fallback_color = _zone_status_fallback_color(key, event) or ANSI_VALUE_POS
             colored_display = _colorize_directional_text(
                 display_text,
                 direction=direction_hint,
-                fallback=ANSI_VALUE_POS,
+                fallback=fallback_color,
             )
         else:
             colored_display = _colorize_directional_text("—", direction=None, fallback=ANSI_VALUE_ZERO)
@@ -9784,11 +9813,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                     evt.get("text"),
                     disp,
                 )
+                fallback_color = _zone_status_fallback_color(key, evt)
                 summary.append(
                     _colorize_directional_text(
                         disp,
                         direction=direction_hint,
-                        fallback=None,
+                        fallback=fallback_color,
                     )
                 )
 
