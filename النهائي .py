@@ -1727,7 +1727,25 @@ class SmartMoneyAlgoProE5:
         if key:
             if not self._output_enabled_for(key) or not self._box_status_enabled(status):
                 return
-            ts = event_time if isinstance(event_time, int) else box.left
+            if isinstance(event_time, (int, float)):
+                ts_candidate: Optional[int] = int(event_time)
+            else:
+                ts_candidate = None
+                try:
+                    current_time = self.series.get_time()
+                except Exception:
+                    current_time = None
+                if isinstance(current_time, (int, float)) and int(current_time) > 0:
+                    ts_candidate = int(current_time)
+            if ts_candidate is None or ts_candidate <= 0:
+                if isinstance(box.left, (int, float)):
+                    ts_candidate = int(box.left)
+                else:
+                    try:
+                        ts_candidate = int(box.left)
+                    except Exception:
+                        ts_candidate = 0
+            ts = ts_candidate
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
@@ -1858,18 +1876,34 @@ class SmartMoneyAlgoProE5:
                     if key not in ZONE_EVENT_KEYS and not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
-                        events[key] = {
+                        existing_event = events.get(key)
+                        payload = dict(existing_event) if isinstance(existing_event, dict) else {}
+                        payload.update({
                             "text": bx.text,
                             "price": (bx.bottom, bx.top),
-                            "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
-                            "time": bx.left,
-                            "time_display": format_timestamp(bx.left),
-                            "status": events.get(key, {}).get("status", "active"),
-                            "status_display": events.get(key, {}).get(
-                                "status_display",
-                                self.BOX_STATUS_LABELS.get("active", "active"),
-                            ),
-                        }
+                        })
+                        if not isinstance(payload.get("display"), str) or not payload["display"]:
+                            payload["display"] = (
+                                f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}"
+                            )
+                        time_value = payload.get("time")
+                        if not isinstance(time_value, (int, float)) or int(time_value) <= 0:
+                            time_value = bx.left
+                        if isinstance(time_value, (int, float)):
+                            payload["time"] = int(time_value)
+                        elif isinstance(bx.left, (int, float)):
+                            payload["time"] = int(bx.left)
+                        else:
+                            payload["time"] = 0
+                        if not isinstance(payload.get("time_display"), str) or not payload["time_display"] or payload["time_display"] == "—":
+                            payload["time_display"] = format_timestamp(payload["time"])
+                        status_value = payload.get("status")
+                        if not isinstance(status_value, str) or not status_value:
+                            status_value = "active"
+                            payload["status"] = status_value
+                        if not isinstance(payload.get("status_display"), str) or not payload["status_display"]:
+                            payload["status_display"] = self.BOX_STATUS_LABELS.get(status_value, status_value)
+                        events[key] = payload
                         return
 
         bull_color = self.inputs.structure.bull
