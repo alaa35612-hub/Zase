@@ -7643,16 +7643,27 @@ class SmartMoneyAlgoProE5:
             if oi1 is not None:
                 if self.bxf and self.bxf in self.boxes:
                     self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_border_color(self.inputs.structure_util.ote_border)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.ote_text_color)
-                self._register_box_event(self.bxf, status="new")
-                self.bxf_touched = False
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
+                top_val = ot if not is_na(ot) else self.series.get("high")
+                bot_val = ob if not is_na(ob) else self.series.get("low")
+                if is_na(top_val) or is_na(bot_val):
+                    self.bxf = None
+                    self.bxf_touched = False
+                    self.prev_oi1 = NA
+                    self.bxty = 0
+                else:
+                    if top_val < bot_val:
+                        top_val, bot_val = bot_val, top_val
+                    self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
+                    self.bxf.set_border_color(self.inputs.structure_util.ote_border)
+                    self.bxf.set_text("Golden zone")
+                    self.bxf.set_text_color(self.inputs.structure_util.ote_text_color)
+                    self._register_box_event(self.bxf, status="new")
+                    self.bxf_touched = False
+                    self.bxty = 1 if dir_up else -1
+                    self.prev_oi1 = float(oi1)
+            else:
+                self.bxty = 0
+                self.prev_oi1 = NA
 
         self._sync_state_mirrors()
 
