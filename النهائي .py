@@ -214,6 +214,7 @@ def _resolve_recency_window(
     *,
     enabled_override: Optional[bool] = None,
     minutes_override: Optional[int] = None,
+    default_config: Optional["ConsoleEventFilterConfig"] = None,
 ) -> int:
     """Normalise recency values from direct bar counts or minute overrides."""
 
@@ -225,12 +226,87 @@ def _resolve_recency_window(
         if bars <= 0:
             return 0
         return bars
-    return RECENCY_FILTER.resolve_bars(
-        timeframe,
-        timeframe_seconds,
-        enabled_override=enabled_override,
-        minutes_override=minutes_override,
-    )
+
+    base_enabled = RECENCY_FILTER.enabled
+    base_minutes: int = RECENCY_FILTER.minutes
+    base_bars: Optional[int] = None
+    if default_config is not None:
+        base_enabled = bool(default_config.enabled)
+        base_minutes = default_config.minutes
+        base_bars = default_config.bars
+
+    if enabled_override is not None:
+        base_enabled = bool(enabled_override)
+    if not base_enabled:
+        return 0
+
+    config_bars: Optional[int] = None
+    if base_bars is not None:
+        try:
+            coerced = int(base_bars)
+        except (TypeError, ValueError):
+            coerced = 0
+        if coerced > 0:
+            config_bars = coerced
+
+    try:
+        minutes_value = max(0, int(base_minutes))
+    except (TypeError, ValueError):
+        minutes_value = 0
+
+    if minutes_override is not None:
+        try:
+            minutes_value = max(0, int(minutes_override))
+        except (TypeError, ValueError):
+            minutes_value = 0
+        config_bars = None
+
+    if config_bars is not None:
+        return config_bars
+    if minutes_value <= 0:
+        return 0
+    return _resolve_recent_bar_lookback(minutes_value, timeframe, timeframe_seconds)
+
+
+@dataclass(frozen=True)
+class ConsoleEventFilterConfig:
+    """Default console-event window expressed in bars or minutes."""
+
+    enabled: bool = True
+    bars: Optional[int] = None
+    minutes: int = 20
+
+    def resolve_bars(
+        self,
+        timeframe: Optional[str],
+        timeframe_seconds: Optional[int],
+    ) -> int:
+        if not self.enabled:
+            return 0
+        if self.bars is not None:
+            try:
+                bars_value = int(self.bars)
+            except (TypeError, ValueError):
+                bars_value = 0
+            return max(0, bars_value)
+        try:
+            minutes_value = max(0, int(self.minutes))
+        except (TypeError, ValueError):
+            minutes_value = 0
+        if minutes_value <= 0:
+            return 0
+        return _resolve_recent_bar_lookback(minutes_value, timeframe, timeframe_seconds)
+
+
+# لتخصيص عدد الشموع التي تُعرض فيها أحدث الأحداث على وحدة التحكم قم بتعديل
+# هذا الإعداد. ``bars`` يسمح بتحديد عدد الشموع بشكل مباشر (مثل 5 أو 10)،
+# بينما ``minutes`` يضبط النافذة بالاعتماد على الإطار الزمني النشط. إذا تم
+# توفير قيمة في ``bars`` فسيتم تجاهل الدقائق.
+CONSOLE_EVENT_FILTER = ConsoleEventFilterConfig(
+    enabled=True,
+    bars=None,
+    minutes=20,
+)
 
 
 @dataclass(frozen=True)
@@ -271,7 +347,7 @@ class _EditorAutorunDefaults:
 
     def __post_init__(self) -> None:
         seconds = _infer_seconds_from_timeframe(self.timeframe)
-        resolved_recent = RECENCY_FILTER.resolve_bars(self.timeframe, seconds)
+        resolved_recent = CONSOLE_EVENT_FILTER.resolve_bars(self.timeframe, seconds)
         object.__setattr__(self, "recent_bars", max(0, resolved_recent))
 
 
@@ -1059,7 +1135,7 @@ class CandleInputs:
 
 @dataclass
 class ConsoleInputs:
-    max_age_bars: int = 1
+    max_age_bars: Optional[int] = None
     recency_enabled: Optional[bool] = None
     recency_minutes: Optional[int] = None
 
@@ -1529,6 +1605,7 @@ class SmartMoneyAlgoProE5:
             self.base_tf_seconds,
             enabled_override=console_enabled_override,
             minutes_override=console_minutes_override,
+            default_config=CONSOLE_EVENT_FILTER,
         )
         self.console_max_age_bars = max(0, resolved_console_age)
         retracement_recent = RECENCY_FILTER.resolve_bars(
@@ -9330,13 +9407,20 @@ def scan_binance(
     window = recent_window_bars
     if window is None:
         console_inputs = getattr(inputs, "console", None) if inputs else None
-        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
-            try:
-                window = int(console_inputs.max_age_bars) + 1
-            except Exception:
-                window = 2
+        max_age_override = getattr(console_inputs, "max_age_bars", None) if console_inputs else None
+        if max_age_override is None:
+            tf_seconds = _infer_seconds_from_timeframe(timeframe)
+            window = CONSOLE_EVENT_FILTER.resolve_bars(timeframe, tf_seconds)
         else:
-            window = 2
+            try:
+                window = int(max_age_override) + 1
+            except Exception:
+                window = 0
+        if window is None or window <= 0:
+            tf_seconds = _infer_seconds_from_timeframe(timeframe)
+            window = CONSOLE_EVENT_FILTER.resolve_bars(timeframe, tf_seconds)
+    if window is None or window <= 0:
+        window = 1
     window = max(1, int(window))
     for idx, symbol in enumerate(all_symbols):
         try:
@@ -9457,8 +9541,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=1,
-        help="Ignore console events older than this many completed bars (minimum 1)",
+        default=None,
+        help="حدد عدد الشموع لاستبعاد الأحداث الأقدم (اتركه فارغًا لاستخدام الإعداد التلقائي أو 0 لتعطيله)",
     )
     parser.add_argument(
         "--continuous",
@@ -9484,8 +9568,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
-    if args.max_age_bars <= 0:
-        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
+    if args.max_age_bars is not None and args.max_age_bars < 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
 
