@@ -126,9 +126,55 @@ ANSI_HEADER_COLORS = [
 # ``STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK`` allows quick toggling of the
 # recency guard that filters CHOCH/BOS retracement alerts.  Set it to ``False``
 # to show every mitigation regardless of age, or keep it ``True`` and adjust
-# ``STRUCTURE_RETRACEMENT_RECENT_BARS`` to the desired bar lookback window.
+# ``STRUCTURE_RETRACEMENT_RECENT_BARS`` to the desired one-minute equivalent
+# window so higher timeframes scale automatically.
 STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK: bool = True
-STRUCTURE_RETRACEMENT_RECENT_BARS: int = 50
+STRUCTURE_RETRACEMENT_RECENT_BARS: int = 20
+
+
+def _infer_seconds_from_timeframe(timeframe: Optional[str]) -> Optional[int]:
+    """Best-effort conversion from timeframe strings into seconds."""
+
+    if timeframe is None:
+        return None
+    tf = timeframe.strip().upper()
+    if not tf:
+        return None
+    try:
+        if tf.endswith("H"):
+            return int(float(tf[:-1]) * 3600)
+        if tf.endswith("D"):
+            return int(float(tf[:-1]) * 86400)
+        if tf.endswith("W"):
+            return int(float(tf[:-1]) * 7 * 86400)
+        if tf.endswith("M"):
+            return int(float(tf[:-1]) * 30 * 86400)
+        if tf.endswith("S"):
+            return int(float(tf[:-1]))
+        if tf.isdigit():
+            return int(tf) * 60
+    except ValueError:
+        return None
+    return None
+
+
+def _resolve_recent_bar_lookback(
+    base_bars: int, timeframe: Optional[str], timeframe_seconds: Optional[int]
+) -> int:
+    """Scale a one-minute bar window to the active timeframe."""
+
+    try:
+        base = int(base_bars)
+    except (TypeError, ValueError):
+        base = 0
+    if base <= 0:
+        return 0
+    seconds = timeframe_seconds if timeframe_seconds is not None else _infer_seconds_from_timeframe(timeframe)
+    if seconds is None or seconds <= 0:
+        return max(0, base)
+    lookback_seconds = base * 60
+    scaled_bars = math.ceil(lookback_seconds / seconds)
+    return max(1, scaled_bars)
 
 
 @dataclass(frozen=True)
@@ -159,17 +205,24 @@ class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
     max_symbols: int = 600
-    recent_bars: int = (
-        STRUCTURE_RETRACEMENT_RECENT_BARS
-        if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK
-        else 0
-    )
+    recent_bars: int = 0
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
     height_threshold: Optional[float] = None
     height_candle_window: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK:
+            resolved_recent = _resolve_recent_bar_lookback(
+                STRUCTURE_RETRACEMENT_RECENT_BARS,
+                self.timeframe,
+                _infer_seconds_from_timeframe(self.timeframe),
+            )
+        else:
+            resolved_recent = 0
+        object.__setattr__(self, "recent_bars", max(0, resolved_recent))
 
 
 # لتفعيل التشغيل المستمر افتراضيًا يمكنك تعديل المتغير التالي إلى True
@@ -1411,18 +1464,23 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
+            raw_max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
         else:
             try:
-                max_age = int(
+                raw_max_age = int(
                     getattr(console_inputs, "max_age_bars", STRUCTURE_RETRACEMENT_RECENT_BARS)
                     or STRUCTURE_RETRACEMENT_RECENT_BARS
                 )
             except (TypeError, ValueError):
-                max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
-        self.console_max_age_bars = max(1, max_age)
+                raw_max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
+        resolved_console_age = _resolve_recent_bar_lookback(
+            raw_max_age, self.base_timeframe, self.base_tf_seconds
+        )
+        self.console_max_age_bars = max(1, resolved_console_age)
         if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK:
-            retracement_recent = STRUCTURE_RETRACEMENT_RECENT_BARS
+            retracement_recent = _resolve_recent_bar_lookback(
+                STRUCTURE_RETRACEMENT_RECENT_BARS, self.base_timeframe, self.base_tf_seconds
+            )
         else:
             retracement_recent = 0
         self.retracement_recent_bars: int = max(0, retracement_recent)
