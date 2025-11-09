@@ -123,20 +123,27 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+STRUCTURE_RETRACEMENT_RECENT_BARS: int = 50
+
+
 @dataclass(frozen=True)
 class OutputSettings:
     """Global switches that control which runtime outputs remain active."""
 
-    show_idm_ob: bool = True
-    show_hist_idm_ob: bool = True
-    show_ext_ob: bool = True
-    show_hist_ext_ob: bool = True
-    show_golden_zone: bool = True
+    show_idm_ob: bool = False
+    show_hist_idm_ob: bool = False
+    show_ext_ob: bool = False
+    show_hist_ext_ob: bool = False
+    show_golden_zone: bool = False
     enable_new_events: bool = True
     enable_touched_events: bool = True
     enable_retest_events: bool = True
     enable_archived_events: bool = True
     enable_active_events: bool = True
+    show_additional_console_signals: bool = False
+    show_structure_break_events: bool = False
+    enable_choch_retracement_alerts: bool = True
+    enable_bos_retracement_alerts: bool = True
 
 
 OUTPUT_SETTINGS = OutputSettings()
@@ -147,7 +154,7 @@ class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
     max_symbols: int = 600
-    recent_bars: int = 2
+    recent_bars: int = STRUCTURE_RETRACEMENT_RECENT_BARS
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
@@ -1395,13 +1402,19 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 1
+            max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+                max_age = int(
+                    getattr(console_inputs, "max_age_bars", STRUCTURE_RETRACEMENT_RECENT_BARS)
+                    or STRUCTURE_RETRACEMENT_RECENT_BARS
+                )
             except (TypeError, ValueError):
-                max_age = 1
+                max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
         self.console_max_age_bars = max(1, max_age)
+        self.retracement_recent_bars: int = max(0, STRUCTURE_RETRACEMENT_RECENT_BARS)
+        self._choch_retracement_console_keys: Set[str] = set()
+        self._bos_retracement_console_keys: Set[str] = set()
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1553,6 +1566,77 @@ class SmartMoneyAlgoProE5:
             return True
         return bars_ago <= self.console_max_age_bars
 
+    def _structure_retracement_within_recent(self, timestamp: Any) -> bool:
+        if self.retracement_recent_bars <= 0:
+            return True
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return True
+        return bars_ago <= self.retracement_recent_bars
+
+    def _purge_structure_retracement_console(self, prefix: str) -> None:
+        if prefix == "CHOCH":
+            keys = self._choch_retracement_console_keys
+        elif prefix == "BOS":
+            keys = self._bos_retracement_console_keys
+        else:
+            return
+        for key in list(keys):
+            self.console_event_log.pop(key, None)
+            keys.discard(key)
+
+    def _update_structure_retracement_console(
+        self,
+        prefix: str,
+        zone_key: str,
+        status: str,
+        timestamp: int,
+        box: Box,
+        direction_text: str,
+        source_price: Optional[float],
+        source_time: Optional[int],
+    ) -> None:
+        if prefix == "CHOCH":
+            keys = self._choch_retracement_console_keys
+            event_label = "CHOCH"
+        elif prefix == "BOS":
+            keys = self._bos_retracement_console_keys
+            event_label = "BOS"
+        else:
+            return
+        console_key = f"{prefix}_RETRACE::{zone_key}"
+        keys.add(console_key)
+        zone_display_map = {
+            "IDM_OB": "IDM OB",
+            "EXT_OB": "EXT OB",
+            "HIST_IDM_OB": "Hist IDM OB",
+            "HIST_EXT_OB": "Hist EXT OB",
+            "GOLDEN_ZONE": "Golden zone",
+        }
+        zone_display = zone_display_map.get(zone_key, box.text)
+        status_label = self.BOX_STATUS_LABELS.get(status, status)
+        zone_color = ZONE_STATUS_COLORS.get(status, ANSI_ZONE_TOUCHED if status in ("touched", "retest") else ANSI_ZONE_NEW)
+        price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+        base_display = (
+            f"{event_label} {direction_text} → {zone_display} ({status_label}) {price_range}"
+        )
+        colored_display = f"{zone_color}{base_display}{ANSI_RESET}"
+        payload = {
+            "text": f"{event_label} Retracement",
+            "price": (box.bottom, box.top),
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": colored_display,
+            "status": status,
+            "status_display": status_label,
+            "direction_display": direction_text,
+        }
+        if isinstance(source_price, (int, float)):
+            payload["structure_price"] = format_price(float(source_price))
+        if isinstance(source_time, (int, float)):
+            payload["structure_time"] = format_timestamp(int(source_time))
+        self.console_event_log[console_key] = payload
+
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
 
@@ -1625,6 +1709,8 @@ class SmartMoneyAlgoProE5:
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
+        if not OUTPUT_SETTINGS.show_additional_console_signals:
+            return
         text = label.text.strip()
         collapsed = text.replace(" ", "")
         key: Optional[str] = None
@@ -1675,28 +1761,35 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-        self.console_event_log[key] = {
-            "text": key,
-            "price": price,
-            "time": timestamp,
-            "time_display": format_timestamp(timestamp),
-            "display": display,
-            "direction": "bullish" if bullish else "bearish",
-            "direction_display": direction_text,
-            "source": "confirmed",
-        }
+        if OUTPUT_SETTINGS.show_structure_break_events:
+            self.console_event_log[key] = {
+                "text": key,
+                "price": price,
+                "time": timestamp,
+                "time_display": format_timestamp(timestamp),
+                "display": display,
+                "direction": "bullish" if bullish else "bearish",
+                "direction_display": direction_text,
+                "source": "confirmed",
+            }
         if key == "CHOCH":
             self._last_choch_timestamp = timestamp
             self._last_choch_direction = "bullish" if bullish else "bearish"
             self._last_choch_price = price
             self._choch_alerted_zone_ids.clear()
+            self._purge_structure_retracement_console("CHOCH")
         elif key == "BOS":
             self._last_bos_timestamp = timestamp
             self._last_bos_direction = "bullish" if bullish else "bearish"
             self._last_bos_price = price
             self._bos_alerted_zone_ids.clear()
+            self._purge_structure_retracement_console("BOS")
 
     def _output_enabled_for(self, key: str) -> bool:
+        if key.startswith("CHOCH_RETRACE"):
+            return OUTPUT_SETTINGS.enable_choch_retracement_alerts
+        if key.startswith("BOS_RETRACE"):
+            return OUTPUT_SETTINGS.enable_bos_retracement_alerts
         mapping = {
             "IDM_OB": "show_idm_ob",
             "HIST_IDM_OB": "show_hist_idm_ob",
@@ -1734,8 +1827,8 @@ class SmartMoneyAlgoProE5:
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
         if key:
-            if not self._output_enabled_for(key) or not self._box_status_enabled(status):
-                return
+            status_key = status or "active"
+            should_display = self._output_enabled_for(key) and self._box_status_enabled(status_key)
             if isinstance(event_time, (int, float)):
                 ts_candidate: Optional[int] = int(event_time)
             else:
@@ -1757,27 +1850,28 @@ class SmartMoneyAlgoProE5:
             ts = ts_candidate
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
-            tally = self.console_box_status_tally[key]
-            tally[status_key] += 1
-            self.console_event_log[key] = {
-                "text": box.text,
-                "price": (box.bottom, box.top),
-                "time": ts,
-                "time_display": format_timestamp(ts),
-                "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
-                "status": status,
-                "status_display": status_label,
-            }
-            self._trace(
-                "box",
-                "register",
-                timestamp=box.right,
-                key=key,
-                text=box.text,
-                top=box.top,
-                bottom=box.bottom,
-                status=status,
-            )
+            if should_display:
+                tally = self.console_box_status_tally[key]
+                tally[status_key] += 1
+                self.console_event_log[key] = {
+                    "text": box.text,
+                    "price": (box.bottom, box.top),
+                    "time": ts,
+                    "time_display": format_timestamp(ts),
+                    "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
+                    "status": status,
+                    "status_display": status_label,
+                }
+                self._trace(
+                    "box",
+                    "register",
+                    timestamp=box.right,
+                    key=key,
+                    text=box.text,
+                    top=box.top,
+                    bottom=box.bottom,
+                    status=status,
+                )
             if status_key in ("touched", "retest"):
                 self._handle_choch_retracement_alert(key, status_key, ts, box)
                 self._handle_bos_retracement_alert(key, status_key, ts, box)
@@ -1800,9 +1894,15 @@ class SmartMoneyAlgoProE5:
         timestamp: int,
         box: Box,
     ) -> None:
+        if not OUTPUT_SETTINGS.enable_choch_retracement_alerts:
+            return
         if self._last_choch_timestamp is None:
             return
         if timestamp < self._last_choch_timestamp:
+            return
+        if not self._structure_retracement_within_recent(self._last_choch_timestamp):
+            return
+        if not self._structure_retracement_within_recent(timestamp):
             return
         zone_identifier = f"{zone_key}:{id(box)}"
         if zone_identifier in self._choch_alerted_zone_ids:
@@ -1828,6 +1928,16 @@ class SmartMoneyAlgoProE5:
             f"النطاق: {price_range}. سعر CHOCH: {choch_price}. وقت CHOCH: {choch_time}"
         )
         self.alertcondition(True, title, message)
+        self._update_structure_retracement_console(
+            "CHOCH",
+            zone_key,
+            status,
+            timestamp,
+            box,
+            direction_text,
+            self._last_choch_price,
+            self._last_choch_timestamp,
+        )
 
     def _handle_bos_retracement_alert(
         self,
@@ -1836,9 +1946,15 @@ class SmartMoneyAlgoProE5:
         timestamp: int,
         box: Box,
     ) -> None:
+        if not OUTPUT_SETTINGS.enable_bos_retracement_alerts:
+            return
         if self._last_bos_timestamp is None:
             return
         if timestamp < self._last_bos_timestamp:
+            return
+        if not self._structure_retracement_within_recent(self._last_bos_timestamp):
+            return
+        if not self._structure_retracement_within_recent(timestamp):
             return
         zone_identifier = f"{zone_key}:{id(box)}"
         if zone_identifier in self._bos_alerted_zone_ids:
@@ -1864,6 +1980,16 @@ class SmartMoneyAlgoProE5:
             f"النطاق: {price_range}. سعر BOS: {bos_price}. وقت BOS: {bos_time}"
         )
         self.alertcondition(True, title, message)
+        self._update_structure_retracement_console(
+            "BOS",
+            zone_key,
+            status,
+            timestamp,
+            box,
+            direction_text,
+            self._last_bos_price,
+            self._last_bos_timestamp,
+        )
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -1877,6 +2003,9 @@ class SmartMoneyAlgoProE5:
             if not allow_stale and not self._console_event_within_age(payload.get("time")):
                 continue
             events[key] = payload
+
+        if not OUTPUT_SETTINGS.show_additional_console_signals:
+            return events
 
         def record_label(
             key: str,
