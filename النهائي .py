@@ -123,13 +123,43 @@ ANSI_HEADER_COLORS = [
 ]
 
 
-# ``STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK`` allows quick toggling of the
-# recency guard that filters CHOCH/BOS retracement alerts.  Set it to ``False``
-# to show every mitigation regardless of age, or keep it ``True`` and adjust
-# ``STRUCTURE_RETRACEMENT_RECENT_BARS`` to the desired one-minute equivalent
-# window so higher timeframes scale automatically.
-STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK: bool = True
-STRUCTURE_RETRACEMENT_RECENT_BARS: int = 20
+@dataclass(frozen=True)
+class RecencyFilterConfig:
+    """Single source of truth for retracement recency handling."""
+
+    enabled: bool = True
+    minutes: int = 20
+
+    def resolve_bars(
+        self,
+        timeframe: Optional[str],
+        timeframe_seconds: Optional[int],
+        *,
+        enabled_override: Optional[bool] = None,
+        minutes_override: Optional[int] = None,
+    ) -> int:
+        """Return the recency window in bars after applying overrides."""
+
+        enabled = self.enabled if enabled_override is None else bool(enabled_override)
+        if minutes_override is None:
+            minutes = self.minutes
+        else:
+            try:
+                minutes = max(0, int(minutes_override))
+            except (TypeError, ValueError):
+                minutes = 0
+        if not enabled or minutes <= 0:
+            return 0
+        return _resolve_recent_bar_lookback(minutes, timeframe, timeframe_seconds)
+
+
+# ``RECENCY_FILTER`` now encapsulates the historical constants while keeping
+# backwards compatibility with the original module-level names the Pine port
+# relied on.  ``STRUCTURE_RETRACEMENT_RECENT_BARS`` still represents the
+# baseline one-minute window before timeframe scaling.
+RECENCY_FILTER = RecencyFilterConfig()
+STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK: bool = RECENCY_FILTER.enabled
+STRUCTURE_RETRACEMENT_RECENT_BARS: int = RECENCY_FILTER.minutes
 
 
 def _infer_seconds_from_timeframe(timeframe: Optional[str]) -> Optional[int]:
@@ -177,6 +207,32 @@ def _resolve_recent_bar_lookback(
     return max(1, scaled_bars)
 
 
+def _resolve_recency_window(
+    raw_bars: Any,
+    timeframe: Optional[str],
+    timeframe_seconds: Optional[int],
+    *,
+    enabled_override: Optional[bool] = None,
+    minutes_override: Optional[int] = None,
+) -> int:
+    """Normalise recency values from direct bar counts or minute overrides."""
+
+    try:
+        bars = int(raw_bars)
+    except (TypeError, ValueError):
+        bars = None
+    if bars is not None:
+        if bars <= 0:
+            return 0
+        return bars
+    return RECENCY_FILTER.resolve_bars(
+        timeframe,
+        timeframe_seconds,
+        enabled_override=enabled_override,
+        minutes_override=minutes_override,
+    )
+
+
 @dataclass(frozen=True)
 class OutputSettings:
     """Global switches that control which runtime outputs remain active."""
@@ -214,14 +270,8 @@ class _EditorAutorunDefaults:
     height_candle_window: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK:
-            resolved_recent = _resolve_recent_bar_lookback(
-                STRUCTURE_RETRACEMENT_RECENT_BARS,
-                self.timeframe,
-                _infer_seconds_from_timeframe(self.timeframe),
-            )
-        else:
-            resolved_recent = 0
+        seconds = _infer_seconds_from_timeframe(self.timeframe)
+        resolved_recent = RECENCY_FILTER.resolve_bars(self.timeframe, seconds)
         object.__setattr__(self, "recent_bars", max(0, resolved_recent))
 
 
@@ -1010,6 +1060,8 @@ class CandleInputs:
 @dataclass
 class ConsoleInputs:
     max_age_bars: int = 1
+    recency_enabled: Optional[bool] = None
+    recency_minutes: Optional[int] = None
 
 
 @dataclass
@@ -1464,25 +1516,27 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            raw_max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
+            raw_max_age: Any = None
+            console_enabled_override: Optional[bool] = None
+            console_minutes_override: Optional[int] = None
         else:
-            try:
-                raw_max_age = int(
-                    getattr(console_inputs, "max_age_bars", STRUCTURE_RETRACEMENT_RECENT_BARS)
-                    or STRUCTURE_RETRACEMENT_RECENT_BARS
-                )
-            except (TypeError, ValueError):
-                raw_max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
-        resolved_console_age = _resolve_recent_bar_lookback(
-            raw_max_age, self.base_timeframe, self.base_tf_seconds
+            raw_max_age = getattr(console_inputs, "max_age_bars", None)
+            console_enabled_override = getattr(console_inputs, "recency_enabled", None)
+            console_minutes_override = getattr(console_inputs, "recency_minutes", None)
+        resolved_console_age = _resolve_recency_window(
+            raw_max_age,
+            self.base_timeframe,
+            self.base_tf_seconds,
+            enabled_override=console_enabled_override,
+            minutes_override=console_minutes_override,
         )
-        self.console_max_age_bars = max(1, resolved_console_age)
-        if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK:
-            retracement_recent = _resolve_recent_bar_lookback(
-                STRUCTURE_RETRACEMENT_RECENT_BARS, self.base_timeframe, self.base_tf_seconds
-            )
-        else:
-            retracement_recent = 0
+        self.console_max_age_bars = max(0, resolved_console_age)
+        retracement_recent = RECENCY_FILTER.resolve_bars(
+            self.base_timeframe,
+            self.base_tf_seconds,
+            enabled_override=console_enabled_override,
+            minutes_override=console_minutes_override,
+        )
         self.retracement_recent_bars: int = max(0, retracement_recent)
         self._choch_retracement_console_keys: Set[str] = set()
         self._bos_retracement_console_keys: Set[str] = set()
@@ -2485,6 +2539,50 @@ class SmartMoneyAlgoProE5:
             if not self.initialised:
                 self._initialise_state()
             self._update_bar()
+
+    def _update_bar_ict(
+        self,
+        high: Optional[float] = None,
+        low: Optional[float] = None,
+        close: Optional[float] = None,
+    ) -> None:
+        """Compatibility wrapper for legacy ICT-specific callers.
+
+        External automation – including the Android scanner and the bundled ICT
+        strategy harness – historically called ``_update_bar_ict`` directly to
+        refresh only the ICT market-structure overlays.  The helper was dropped
+        by mistake during the recency filter refactor, breaking those entry
+        points.  Re-introducing the method keeps their integration surface
+        stable without forcing a full ``_update_bar`` cycle.
+        """
+
+        if high is None:
+            high = self.series.get("high")
+        if low is None:
+            low = self.series.get("low")
+        if close is None:
+            close = self.series.get("close")
+
+        if high is None or low is None or close is None:
+            return
+
+        try:
+            h = float(high)
+            l = float(low)
+            c = float(close)
+        except (TypeError, ValueError):
+            return
+
+        self._update_ict_market_structure(h, l, c)
+
+        self._trace(
+            "update_bar_ict",
+            "compat",
+            high=h,
+            low=l,
+            close=c,
+            timestamp=self.series.get_time(),
+        )
 
     # ------------------------------------------------------------------
     # State initialisation mirroring Pine ``var`` assignments
@@ -7643,16 +7741,27 @@ class SmartMoneyAlgoProE5:
             if oi1 is not None:
                 if self.bxf and self.bxf in self.boxes:
                     self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_border_color(self.inputs.structure_util.ote_border)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.ote_text_color)
-                self._register_box_event(self.bxf, status="new")
-                self.bxf_touched = False
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
+                top_val = ot if not is_na(ot) else self.series.get("high")
+                bot_val = ob if not is_na(ob) else self.series.get("low")
+                if is_na(top_val) or is_na(bot_val):
+                    self.bxf = None
+                    self.bxf_touched = False
+                    self.prev_oi1 = NA
+                    self.bxty = 0
+                else:
+                    if top_val < bot_val:
+                        top_val, bot_val = bot_val, top_val
+                    self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
+                    self.bxf.set_border_color(self.inputs.structure_util.ote_border)
+                    self.bxf.set_text("Golden zone")
+                    self.bxf.set_text_color(self.inputs.structure_util.ote_text_color)
+                    self._register_box_event(self.bxf, status="new")
+                    self.bxf_touched = False
+                    self.bxty = 1 if dir_up else -1
+                    self.prev_oi1 = float(oi1)
+            else:
+                self.bxty = 0
+                self.prev_oi1 = NA
 
         self._sync_state_mirrors()
 
@@ -9993,7 +10102,24 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
     cfg, args = _parse_args_android()
-    recent_window = max(1, args.recent)
+    recent_window = max(0, args.recent)
+
+    if args.recent_filter == "off":
+        recency_enabled_override: Optional[bool] = False
+    elif args.recent_filter == "on":
+        recency_enabled_override = True
+    else:
+        recency_enabled_override = None
+
+    if args.recent_minutes is None:
+        recency_minutes_override: Optional[int] = None
+    else:
+        recency_minutes_override = max(0, args.recent_minutes)
+
+    if recency_enabled_override is False:
+        recent_window = 0
+
+    console_bars_override = max(0, recent_window - 1) if recent_window > 0 else 0
 
     # Build symbols first with strong filters
     symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
@@ -10028,6 +10154,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     ob = OrderBlockInputs(poi_type=cfg.zone_type)
     utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
 
+    console_inputs = ConsoleInputs(
+        max_age_bars=console_bars_override,
+        recency_enabled=recency_enabled_override,
+        recency_minutes=recency_minutes_override,
+    )
+
     inputs = IndicatorInputs(
         pullback=pullback,
         structure=structure,
@@ -10038,6 +10170,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
         order_block=ob,
         structure_util=utils,
         ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
+        console=console_inputs,
     )
 
     # Run loop
@@ -10063,14 +10196,25 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
         metrics = runtime.gather_console_metrics()
         latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+        recent_hits: List[str]
+        recent_times: List[int]
+        if recent_window > 0:
+            recent_hits, recent_times = _collect_recent_event_hits(
+                runtime.series, latest, bars=recent_window
             )
-            continue
+            if not recent_hits:
+                if recent_window == 1:
+                    span_phrase = "آخر شمعة واحدة"
+                elif recent_window == 2:
+                    span_phrase = "آخر شمعتين"
+                else:
+                    span_phrase = f"آخر {recent_window} شموع"
+                print(
+                    f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                )
+                continue
+        else:
+            recent_hits, recent_times = [], []
 
         recent_alerts = list(runtime.alerts)
         if recent_window > 0 and runtime.series.length() > 0:
@@ -10486,6 +10630,18 @@ def _parse_args_android():
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
+    p.add_argument(
+        "--recent-filter",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="تحديد تفعيل فلتر الأحداث الأخيرة {auto,on,off}",
+    )
+    p.add_argument(
+        "--recent-minutes",
+        type=int,
+        default=None,
+        help="عدد الدقائق (على إطار 1 دقيقة) المستخدم لفلتر الهيكل قبل التحجيم الزمني",
+    )
     p.add_argument("--drop-last", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--show-hl", action="store_true", default=False)
@@ -10584,8 +10740,10 @@ def _parse_args_android():
         p.error("--limit must be > 0")
     if args.max_symbols <= 0:
         p.error("--max-symbols must be > 0")
-    if args.recent <= 0:
-        p.error("--recent يجب أن يكون رقمًا موجبًا")
+    if args.recent < 0:
+        p.error("--recent يجب أن يكون رقمًا غير سالب")
+    if args.recent_minutes is not None and args.recent_minutes < 0:
+        p.error("--recent-minutes يجب أن يكون رقمًا غير سالب")
     if args.height_candles is not None and args.height_candles <= 0:
         p.error("--height-candles يجب أن يكون رقمًا موجبًا")
     if args.continuous_interval < 0:
@@ -10725,7 +10883,24 @@ def _android_cli_entry() -> int:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
     cfg, args = _parse_args_android()
-    recent_window = max(1, args.recent)
+    recent_window = max(0, args.recent)
+
+    if args.recent_filter == "off":
+        recency_enabled_override: Optional[bool] = False
+    elif args.recent_filter == "on":
+        recency_enabled_override = True
+    else:
+        recency_enabled_override = None
+
+    if args.recent_minutes is None:
+        recency_minutes_override: Optional[int] = None
+    else:
+        recency_minutes_override = max(0, args.recent_minutes)
+
+    if recency_enabled_override is False:
+        recent_window = 0
+
+    console_bars_override = max(0, recent_window - 1) if recent_window > 0 else 0
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
 
@@ -10756,12 +10931,24 @@ def _android_cli_entry() -> int:
     utils = StructureInputs(isOTE=cfg.show_ote, markX=cfg.show_mark_x)
     ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
 
-    inputs = IndicatorInputs(
-        pullback=pullback, structure=structure, order_flow=order_flow,
-        fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
-        structure_util=utils, ict_structure=ict,
+    console_inputs = ConsoleInputs(
+        max_age_bars=console_bars_override,
+        recency_enabled=recency_enabled_override,
+        recency_minutes=recency_minutes_override,
     )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
+
+    inputs = IndicatorInputs(
+        pullback=pullback,
+        structure=structure,
+        order_flow=order_flow,
+        fvg=fvg,
+        liquidity=liq,
+        demand_supply=ds,
+        order_block=ob,
+        structure_util=utils,
+        ict_structure=ict,
+        console=console_inputs,
+    )
 
     symbol_override = args.symbol or None
     iteration = 0
@@ -10801,20 +10988,21 @@ def _android_cli_entry() -> int:
 
                 metrics = runtime.gather_console_metrics()
                 latest_events = metrics.get("latest_events") or {}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
-                )
-                if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                if recent_window > 0:
+                    recent_hits, _ = _collect_recent_event_hits(
+                        runtime.series, latest_events, bars=recent_window
                     )
-                    continue
+                    if not recent_hits:
+                        if recent_window == 1:
+                            span_phrase = "آخر شمعة واحدة"
+                        elif recent_window == 2:
+                            span_phrase = "آخر شمعتين"
+                        else:
+                            span_phrase = f"آخر {recent_window} شموع"
+                        print(
+                            f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                        )
+                        continue
 
                 recent_alerts = list(getattr(runtime, "alerts", []))
                 if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
