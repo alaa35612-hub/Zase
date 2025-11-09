@@ -123,6 +123,11 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+# ``STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK`` allows quick toggling of the
+# recency guard that filters CHOCH/BOS retracement alerts.  Set it to ``False``
+# to show every mitigation regardless of age, or keep it ``True`` and adjust
+# ``STRUCTURE_RETRACEMENT_RECENT_BARS`` to the desired bar lookback window.
+STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK: bool = True
 STRUCTURE_RETRACEMENT_RECENT_BARS: int = 50
 
 
@@ -154,7 +159,11 @@ class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
     max_symbols: int = 600
-    recent_bars: int = STRUCTURE_RETRACEMENT_RECENT_BARS
+    recent_bars: int = (
+        STRUCTURE_RETRACEMENT_RECENT_BARS
+        if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK
+        else 0
+    )
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
@@ -1412,7 +1421,11 @@ class SmartMoneyAlgoProE5:
             except (TypeError, ValueError):
                 max_age = STRUCTURE_RETRACEMENT_RECENT_BARS
         self.console_max_age_bars = max(1, max_age)
-        self.retracement_recent_bars: int = max(0, STRUCTURE_RETRACEMENT_RECENT_BARS)
+        if STRUCTURE_RETRACEMENT_ENABLE_RECENCY_CHECK:
+            retracement_recent = STRUCTURE_RETRACEMENT_RECENT_BARS
+        else:
+            retracement_recent = 0
+        self.retracement_recent_bars: int = max(0, retracement_recent)
         self._choch_retracement_console_keys: Set[str] = set()
         self._bos_retracement_console_keys: Set[str] = set()
 
