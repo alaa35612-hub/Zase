@@ -83,6 +83,8 @@ ZONE_EVENT_KEYS = frozenset({
     "GOLDEN_ZONE",
 })
 
+STRUCTURE_RETRACEMENT_ZONE_KEYS = ZONE_EVENT_KEYS
+
 ZONE_STATUS_COLORS = {
     "new": ANSI_ZONE_NEW,
     "touched": ANSI_ZONE_TOUCHED,
@@ -1776,6 +1778,24 @@ class SmartMoneyAlgoProE5:
             return True
         return bars_ago <= self.retracement_recent_bars
 
+    def _structure_retracement_zone_matches_direction(
+        self,
+        direction: str,
+        break_price: Optional[float],
+        box: Box,
+    ) -> bool:
+        if not isinstance(box, Box):
+            return False
+        if not isinstance(break_price, (int, float)):
+            return True
+        price = float(break_price)
+        tolerance = max(abs(price) * 1e-6, 1e-6)
+        if direction == "bullish":
+            return box.top <= price + tolerance
+        if direction == "bearish":
+            return box.bottom >= price - tolerance
+        return True
+
     def _purge_structure_retracement_console(self, prefix: str) -> None:
         if prefix == "CHOCH":
             keys = self._choch_retracement_console_keys
@@ -2106,12 +2126,16 @@ class SmartMoneyAlgoProE5:
             return
         if not self._structure_retracement_within_recent(timestamp):
             return
+        if zone_key not in STRUCTURE_RETRACEMENT_ZONE_KEYS:
+            return
         zone_identifier = f"{zone_key}:{id(box)}"
         if zone_identifier in self._choch_alerted_zone_ids:
             return
         self._choch_alerted_zone_ids.add(zone_identifier)
         direction = self._last_choch_direction or "neutral"
         direction_text = "صاعد" if direction == "bullish" else "هابط" if direction == "bearish" else "محايد"
+        if not self._structure_retracement_zone_matches_direction(direction, self._last_choch_price, box):
+            return
         zone_display_map = {
             "IDM_OB": "IDM OB",
             "EXT_OB": "EXT OB",
@@ -2158,12 +2182,16 @@ class SmartMoneyAlgoProE5:
             return
         if not self._structure_retracement_within_recent(timestamp):
             return
+        if zone_key not in STRUCTURE_RETRACEMENT_ZONE_KEYS:
+            return
         zone_identifier = f"{zone_key}:{id(box)}"
         if zone_identifier in self._bos_alerted_zone_ids:
             return
         self._bos_alerted_zone_ids.add(zone_identifier)
         direction = self._last_bos_direction or "neutral"
         direction_text = "صاعد" if direction == "bullish" else "هابط" if direction == "bearish" else "محايد"
+        if not self._structure_retracement_zone_matches_direction(direction, self._last_bos_price, box):
+            return
         zone_display_map = {
             "IDM_OB": "IDM OB",
             "EXT_OB": "EXT OB",
