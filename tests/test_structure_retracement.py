@@ -56,8 +56,8 @@ def test_bos_retracement_accepts_zone_below_break():
     algo._last_bos_timestamp = 1000
     algo._last_bos_direction = "bullish"
     algo._last_bos_price = 100.0
-    box = _make_box("EXT OB", top=99.6, bottom=98.6, left=900, right=1000)
-    algo._register_box_event(box, status="new", event_time=900)
+    box = _make_box("EXT OB", top=99.6, bottom=98.6, left=1005, right=1005)
+    algo._register_box_event(box, status="new", event_time=1005)
     box.set_right(1010)
     algo._register_box_event(box, status="touched", event_time=1010)
     assert any("BOS Retracement" in alert for _, alert in algo.alerts)
@@ -76,8 +76,8 @@ def test_bos_retracement_rejects_zone_above_break():
     algo._last_bos_timestamp = 1000
     algo._last_bos_direction = "bullish"
     algo._last_bos_price = 100.0
-    box = _make_box("EXT OB", top=101.5, bottom=100.5, left=900, right=1000)
-    algo._register_box_event(box, status="new", event_time=900)
+    box = _make_box("EXT OB", top=101.5, bottom=100.5, left=1005, right=1005)
+    algo._register_box_event(box, status="new", event_time=1005)
     box.set_right(1010)
     algo._register_box_event(box, status="touched", event_time=1010)
     assert not any("Retracement" in alert for _, alert in algo.alerts)
@@ -95,14 +95,14 @@ def test_choch_bearish_prefers_zones_above_break():
     algo._last_choch_timestamp = 2000
     algo._last_choch_direction = "bearish"
     algo._last_choch_price = 250.0
-    idm_box = _make_box("IDM OB", top=256, bottom=254, left=1980, right=2000)
-    algo._register_box_event(idm_box, status="new", event_time=1980)
+    idm_box = _make_box("IDM OB", top=256, bottom=254, left=2005, right=2005)
+    algo._register_box_event(idm_box, status="new", event_time=2005)
     idm_box.set_right(2010)
     algo._register_box_event(idm_box, status="touched", event_time=2010)
     assert any("CHOCH Retracement" in alert for _, alert in algo.alerts)
 
-    golden = _make_box("Golden zone", top=247, bottom=245, left=1985, right=2000)
-    algo._register_box_event(golden, status="new", event_time=1985)
+    golden = _make_box("Golden zone", top=247, bottom=245, left=2005, right=2005)
+    algo._register_box_event(golden, status="new", event_time=2005)
     golden.set_right(2010)
     algo._register_box_event(golden, status="touched", event_time=2010)
     choch_alerts = [alert for _, alert in algo.alerts if "CHOCH Retracement" in alert]
@@ -122,8 +122,8 @@ def test_disabled_zone_type_suppresses_alerts():
     algo._last_bos_timestamp = 3000
     algo._last_bos_direction = "bullish"
     algo._last_bos_price = 101.0
-    golden = _make_box("Golden zone", top=100.8, bottom=99.2, left=2980, right=3000)
-    algo._register_box_event(golden, status="new", event_time=2980)
+    golden = _make_box("Golden zone", top=100.8, bottom=99.2, left=3005, right=3005)
+    algo._register_box_event(golden, status="new", event_time=3005)
     golden.set_right(3010)
     algo._register_box_event(golden, status="touched", event_time=3010)
     assert not any("Retracement" in alert for _, alert in algo.alerts)
@@ -142,8 +142,8 @@ def test_first_touch_only_blocks_retests():
     algo._last_bos_timestamp = 4000
     algo._last_bos_direction = "bullish"
     algo._last_bos_price = 50.5
-    zone = _make_box("EXT OB", top=50.3, bottom=49.3, left=3980, right=4000)
-    algo._register_box_event(zone, status="new", event_time=3980)
+    zone = _make_box("EXT OB", top=50.3, bottom=49.3, left=4005, right=4005)
+    algo._register_box_event(zone, status="new", event_time=4005)
     zone.set_right(4010)
     algo._register_box_event(zone, status="touched", event_time=4010)
     zone.set_right(4020)
@@ -167,8 +167,8 @@ def test_expired_validity_window_blocks_alert():
     algo._last_bos_timestamp = 5000
     algo._last_bos_direction = "bullish"
     algo._last_bos_price = 121.0
-    zone = _make_box("EXT OB", top=120.8, bottom=119.8, left=4980, right=5000)
-    algo._register_box_event(zone, status="new", event_time=4980)
+    zone = _make_box("EXT OB", top=120.8, bottom=119.8, left=5005, right=5005)
+    algo._register_box_event(zone, status="new", event_time=5005)
     zone.set_right(5030)
     algo._register_box_event(zone, status="touched", event_time=5030)
     assert not any("Retracement" in alert for _, alert in algo.alerts)
@@ -187,8 +187,47 @@ def test_use_wicks_false_requires_body_touch():
     algo._last_bos_timestamp = 6000
     algo._last_bos_direction = "bullish"
     algo._last_bos_price = 71.0
-    zone = _make_box("EXT OB", top=70.2, bottom=69.4, left=5980, right=6000)
-    algo._register_box_event(zone, status="new", event_time=5980)
+    zone = _make_box("EXT OB", top=70.2, bottom=69.4, left=6005, right=6005)
+    algo._register_box_event(zone, status="new", event_time=6005)
     zone.set_right(6010)
     algo._register_box_event(zone, status="touched", event_time=6010)
+    assert not any("Retracement" in alert for _, alert in algo.alerts)
+
+
+def test_zone_created_before_break_is_ignored():
+    algo = _base_algo()
+    _seed_series(
+        algo,
+        [
+            {"time": 7000, "open": 40, "high": 44, "low": 39, "close": 43, "volume": 0},
+            {"time": 7010, "open": 43, "high": 46, "low": 41, "close": 45, "volume": 0},
+            {"time": 7020, "open": 45, "high": 47, "low": 42, "close": 43, "volume": 0},
+        ],
+    )
+    algo._last_bos_timestamp = 7010
+    algo._last_bos_direction = "bullish"
+    algo._last_bos_price = 44.0
+    zone = _make_box("EXT OB", top=43.2, bottom=42.2, left=6980, right=7000)
+    algo._register_box_event(zone, status="new", event_time=7000)
+    zone.set_right(7020)
+    algo._register_box_event(zone, status="touched", event_time=7020)
+    assert not any("Retracement" in alert for _, alert in algo.alerts)
+
+
+def test_touch_at_break_timestamp_is_ignored():
+    algo = _base_algo()
+    _seed_series(
+        algo,
+        [
+            {"time": 8000, "open": 200, "high": 205, "low": 198, "close": 204, "volume": 0},
+            {"time": 8010, "open": 204, "high": 206, "low": 199, "close": 200, "volume": 0},
+        ],
+    )
+    algo._last_bos_timestamp = 8000
+    algo._last_bos_direction = "bullish"
+    algo._last_bos_price = 203.0
+    zone = _make_box("EXT OB", top=202.5, bottom=201.0, left=8005, right=8005)
+    algo._register_box_event(zone, status="new", event_time=8005)
+    zone.set_right(8000)
+    algo._register_box_event(zone, status="touched", event_time=8000)
     assert not any("Retracement" in alert for _, alert in algo.alerts)

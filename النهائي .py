@@ -2487,13 +2487,21 @@ class SmartMoneyAlgoProE5:
 
         if break_timestamp is None or break_price is None:
             return None
-        if timestamp < break_timestamp:
+        if timestamp <= break_timestamp:
             return None
         if direction not in ("bullish", "bearish"):
             return None
         if not self._structure_retracement_within_recent(break_timestamp):
             return None
         if not self._structure_retracement_within_recent(timestamp):
+            return None
+
+        creation_ts = descriptor.created_at
+        if creation_ts is None or creation_ts <= 0:
+            return None
+        if creation_ts <= break_timestamp:
+            return None
+        if not self._structure_retracement_within_recent(creation_ts):
             return None
 
         window_bars = self._resolve_retest_window_bars(zone_rule)
