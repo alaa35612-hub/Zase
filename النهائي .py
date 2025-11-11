@@ -24,8 +24,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import bisect
+import copy
 import dataclasses
 import datetime
+import hashlib
 import inspect
 import json
 import math
@@ -90,6 +92,205 @@ ZONE_STATUS_COLORS = {
     "touched": ANSI_ZONE_TOUCHED,
     "retest": ANSI_ZONE_TOUCHED,
 }
+
+ZONE_DISPLAY_NAMES = {
+    "IDM_OB": "IDM OB",
+    "EXT_OB": "EXT OB",
+    "HIST_IDM_OB": "Hist IDM OB",
+    "HIST_EXT_OB": "Hist EXT OB",
+    "GOLDEN_ZONE": "Golden zone",
+}
+
+
+@dataclass
+class ZoneTouchRule:
+    """إعدادات لمس المناطق بعد كسر هيكل السوق."""
+
+    enabled: bool = True
+    use_wicks: bool = True
+    first_touch_only: bool = True
+    max_retests: int = 1
+    validity_bars: Optional[int] = None
+    validity_minutes: Optional[int] = None
+    tolerance_ticks: float = 0.0
+
+
+@dataclass
+class StructureBreakSettings:
+    """المعايير الدنيا لاعتماد كسر BOS أو CHOCH وفق مبادئ ICT."""
+
+    min_displacement_multiple: float = 1.5
+    min_break_body_ratio: float = 0.6
+    lookback_swings: int = 300
+
+
+@dataclass
+class RetestWindowSettings:
+    """النافذة الزمنية/السعرية التي تعتبر إعادة الاختبار صالحة خلالها."""
+
+    validity_bars: int = 120
+    validity_minutes: Optional[int] = None
+    tolerance_ticks: float = 1.0
+
+
+@dataclass
+class AlertSettings:
+    """ضبط سلوك التنبيهات لمنع التكرار وتحديد اللغة."""
+
+    dedupe_window_bars: int = 10
+    language: str = "ar"
+
+
+@dataclass
+class StructureRetracementSettings:
+    """الحزمة الكاملة لإعدادات تصحيحات الهيكل."""
+
+    zones: Dict[str, ZoneTouchRule] = field(default_factory=dict)
+    structure: StructureBreakSettings = field(default_factory=StructureBreakSettings)
+    retests: RetestWindowSettings = field(default_factory=RetestWindowSettings)
+    alerts: AlertSettings = field(default_factory=AlertSettings)
+
+    def copy(self) -> "StructureRetracementSettings":
+        """Deep copy to allow instance level overrides without side effects."""
+
+        return StructureRetracementSettings(
+            zones={key: dataclasses.replace(rule) for key, rule in self.zones.items()},
+            structure=dataclasses.replace(self.structure),
+            retests=dataclasses.replace(self.retests),
+            alerts=dataclasses.replace(self.alerts),
+        )
+
+
+DEFAULT_STRUCTURE_RETRACEMENT_SETTINGS = StructureRetracementSettings(
+    zones={
+        key: ZoneTouchRule()
+        for key in (
+            "EXT_OB",
+            "HIST_EXT_OB",
+            "IDM_OB",
+            "HIST_IDM_OB",
+            "GOLDEN_ZONE",
+        )
+    },
+    structure=StructureBreakSettings(
+        min_displacement_multiple=1.5,
+        min_break_body_ratio=0.6,
+        lookback_swings=300,
+    ),
+    retests=RetestWindowSettings(
+        validity_bars=120,
+        validity_minutes=None,
+        tolerance_ticks=1.0,
+    ),
+    alerts=AlertSettings(
+        dedupe_window_bars=10,
+        language="ar",
+    ),
+)
+
+# ``SETTINGS`` exposes the default structure retracement configuration for
+# backwards-compatible imports and documentation references.
+SETTINGS = DEFAULT_STRUCTURE_RETRACEMENT_SETTINGS
+
+
+def _rounded_price(value: float, digits: int = 8) -> float:
+    """Round prices to a stable precision for hashing/comparisons."""
+
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def normalize_zone_key(text: str) -> Optional[str]:
+    """Map النصوص الظاهرة على الصندوق إلى المفاتيح الموحدة."""
+
+    if not isinstance(text, str):
+        return None
+    mapping = {
+        "IDM OB": "IDM_OB",
+        "EXT OB": "EXT_OB",
+        "Hist IDM OB": "HIST_IDM_OB",
+        "Hist EXT OB": "HIST_EXT_OB",
+        "Golden zone": "GOLDEN_ZONE",
+    }
+    return mapping.get(text.strip())
+
+
+def zone_matches_direction(direction: str, break_price: Optional[float], box: Box, tol: float = 1e-8) -> bool:
+    """تحقق من توافق المنطقة مع اتجاه الكسر السعري."""
+
+    if not isinstance(box, Box):
+        return False
+    if not isinstance(break_price, (int, float)):
+        return False
+    price = float(break_price)
+    tolerance = float(tol)
+    if direction == "bullish":
+        return float(box.top) <= price + tolerance
+    if direction == "bearish":
+        return float(box.bottom) >= price - tolerance
+    return False
+
+
+def _compute_zone_identifier(zone_key: str, box: Box, timeframe: str) -> str:
+    """Hash ثابت يدمج النوع وحدود الصندوق والإطار الزمني."""
+
+    top = _rounded_price(box.top)
+    bottom = _rounded_price(box.bottom)
+    payload = f"{zone_key}|{timeframe}|{top:.8f}|{bottom:.8f}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _resolve_touch_tolerance(rule: ZoneTouchRule, settings: StructureRetracementSettings) -> float:
+    base = settings.retests.tolerance_ticks
+    per_zone = rule.tolerance_ticks
+    tolerance = per_zone if per_zone and per_zone > 0 else base
+    return float(tolerance) if tolerance else 0.0
+
+
+@dataclass
+class ZoneDescriptor:
+    """تعريف موحّد للمنطقة لتتبع حالتها عبر الزمن."""
+
+    zone_id: str
+    zone_key: str
+    top: float
+    bottom: float
+    timeframe: str
+    created_at: Optional[int] = None
+    last_updated: Optional[int] = None
+    left: Optional[int] = None
+    right: Optional[int] = None
+
+
+@dataclass
+class ZoneRetestProgress:
+    """حالة إعادة اختبار واحدة مرتبطة بكسر محدّد."""
+
+    zone_id: str
+    zone_key: str
+    break_type: str
+    break_timestamp: int
+    break_price: float
+    direction: str
+    touches: int = 0
+    notified: bool = False
+    last_touch_timestamp: Optional[int] = None
+    last_touch_bar_index: Optional[int] = None
+    created_at: Optional[int] = None
+
+
+@dataclass
+class StructureRetestEvent:
+    """نتيجة إعادة الاختبار التي تستعمل للتنبيه والتسجيل."""
+
+    progress: ZoneRetestProgress
+    status: str
+    timestamp: int
+    direction_text: str
+    zone_display: str
+    bars_since_break: Optional[int]
 
 ALERT_BULLISH_KEYWORDS = (
     "bull",
@@ -1592,6 +1793,13 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.structure_settings = DEFAULT_STRUCTURE_RETRACEMENT_SETTINGS.copy()
+        self._zone_catalog: Dict[str, ZoneDescriptor] = {}
+        self._retest_states: Dict[str, Dict[str, ZoneRetestProgress]] = {"CHOCH": {}, "BOS": {}}
+        self._retest_alert_index: Dict[str, Dict[str, int]] = {"CHOCH": {}, "BOS": {}}
+        self._body_range_history: List[float] = []
+        self._range_history: List[float] = []
+        self._min_price_step: float = 0.0
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             raw_max_age: Any = None
@@ -1647,11 +1855,9 @@ class SmartMoneyAlgoProE5:
         self._last_choch_timestamp: Optional[int] = None
         self._last_choch_direction: Optional[str] = None
         self._last_choch_price: Optional[float] = None
-        self._choch_alerted_zone_ids: Set[str] = set()
         self._last_bos_timestamp: Optional[int] = None
         self._last_bos_direction: Optional[str] = None
         self._last_bos_price: Optional[float] = None
-        self._bos_alerted_zone_ids: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1778,22 +1984,67 @@ class SmartMoneyAlgoProE5:
             return True
         return bars_ago <= self.retracement_recent_bars
 
-    def _structure_retracement_zone_matches_direction(
-        self,
-        direction: str,
-        break_price: Optional[float],
-        box: Box,
-    ) -> bool:
-        if not isinstance(box, Box):
-            return False
-        if not isinstance(break_price, (int, float)):
+    def _average_body_range(self) -> float:
+        if not self._body_range_history:
+            return 0.0
+        return sum(self._body_range_history) / float(len(self._body_range_history))
+
+    def _average_true_range(self) -> float:
+        if not self._range_history:
+            return 0.0
+        return sum(self._range_history) / float(len(self._range_history))
+
+    def _update_displacement_metrics(self, open_: Any, high: Any, low: Any, close: Any) -> None:
+        try:
+            o_val = float(open_)
+            h_val = float(high)
+            l_val = float(low)
+            c_val = float(close)
+        except (TypeError, ValueError):
+            return
+        if math.isnan(o_val) or math.isnan(h_val) or math.isnan(l_val) or math.isnan(c_val):
+            return
+        body = abs(c_val - o_val)
+        true_range = abs(h_val - l_val)
+        self._body_range_history.append(body)
+        self._range_history.append(true_range)
+        lookback = max(10, int(self.structure_settings.structure.lookback_swings))
+        if len(self._body_range_history) > lookback:
+            self._body_range_history.pop(0)
+        if len(self._range_history) > lookback:
+            self._range_history.pop(0)
+        prev_close = self.series.get("close", 1)
+        diffs: List[float] = []
+        try:
+            prev_close_val = float(prev_close)
+            if not math.isnan(prev_close_val):
+                diffs.append(abs(c_val - prev_close_val))
+        except (TypeError, ValueError):
+            pass
+        diffs.append(body)
+        for diff in diffs:
+            if diff > 0 and not math.isnan(diff):
+                if self._min_price_step == 0.0 or diff < self._min_price_step:
+                    self._min_price_step = diff
+
+    def _structure_break_has_displacement(self, bullish: bool) -> bool:
+        settings = self.structure_settings.structure
+        try:
+            open_ = float(self.series.get("open"))
+            close = float(self.series.get("close"))
+            high = float(self.series.get("high"))
+            low = float(self.series.get("low"))
+        except (TypeError, ValueError):
             return True
-        price = float(break_price)
-        tolerance = max(abs(price) * 1e-6, 1e-6)
-        if direction == "bullish":
-            return box.top <= price + tolerance
-        if direction == "bearish":
-            return box.bottom >= price - tolerance
+        if any(math.isnan(val) for val in (open_, close, high, low)):
+            return True
+        body = abs(close - open_)
+        true_range = max(abs(high - low), 1e-8)
+        avg_range = self._average_true_range()
+        if avg_range > 0 and true_range < settings.min_displacement_multiple * avg_range:
+            return False
+        if true_range > 0 and (body / true_range) < settings.min_break_body_ratio:
+            return False
         return True
 
     def _purge_structure_retracement_console(self, prefix: str) -> None:
@@ -1981,6 +2232,8 @@ class SmartMoneyAlgoProE5:
         *,
         bullish: bool,
     ) -> None:
+        if not self._structure_break_has_displacement(bullish):
+            return
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
         if OUTPUT_SETTINGS.show_structure_break_events:
@@ -1998,13 +2251,15 @@ class SmartMoneyAlgoProE5:
             self._last_choch_timestamp = timestamp
             self._last_choch_direction = "bullish" if bullish else "bearish"
             self._last_choch_price = price
-            self._choch_alerted_zone_ids.clear()
+            self._retest_states["CHOCH"].clear()
+            self._retest_alert_index["CHOCH"].clear()
             self._purge_structure_retracement_console("CHOCH")
         elif key == "BOS":
             self._last_bos_timestamp = timestamp
             self._last_bos_direction = "bullish" if bullish else "bearish"
             self._last_bos_price = price
-            self._bos_alerted_zone_ids.clear()
+            self._retest_states["BOS"].clear()
+            self._retest_alert_index["BOS"].clear()
             self._purge_structure_retracement_console("BOS")
 
     def _output_enabled_for(self, key: str) -> bool:
@@ -2035,79 +2290,313 @@ class SmartMoneyAlgoProE5:
             return OUTPUT_SETTINGS.enable_archived_events
         return OUTPUT_SETTINGS.enable_active_events
 
+    def _resolve_box_event_timestamp(self, box: Box, event_time: Optional[int]) -> int:
+        if isinstance(event_time, (int, float)):
+            return max(0, int(event_time))
+        current_time: Optional[int]
+        try:
+            current_time = self.series.get_time()
+        except Exception:
+            current_time = None
+        if isinstance(current_time, (int, float)) and int(current_time) > 0:
+            return int(current_time)
+        if isinstance(box.left, (int, float)) and int(box.left) > 0:
+            return int(box.left)
+        if isinstance(box.right, (int, float)) and int(box.right) > 0:
+            return int(box.right)
+        return 0
+
+    def _track_zone_descriptor(
+        self,
+        zone_key: str,
+        box: Box,
+        status: str,
+        timestamp: int,
+    ) -> ZoneDescriptor:
+        timeframe = self.base_timeframe or ""
+        zone_id = _compute_zone_identifier(zone_key, box, timeframe)
+        descriptor = self._zone_catalog.get(zone_id)
+        if descriptor is None:
+            descriptor = ZoneDescriptor(
+                zone_id=zone_id,
+                zone_key=zone_key,
+                top=float(box.top),
+                bottom=float(box.bottom),
+                timeframe=timeframe,
+                created_at=timestamp if status == "new" else None,
+                last_updated=timestamp if timestamp > 0 else None,
+                left=int(box.left) if isinstance(box.left, (int, float)) else None,
+                right=int(box.right) if isinstance(box.right, (int, float)) else None,
+            )
+            self._zone_catalog[zone_id] = descriptor
+        else:
+            descriptor.top = float(box.top)
+            descriptor.bottom = float(box.bottom)
+            if isinstance(box.left, (int, float)):
+                descriptor.left = int(box.left)
+            if isinstance(box.right, (int, float)):
+                descriptor.right = int(box.right)
+            if status == "new" and timestamp > 0:
+                descriptor.created_at = timestamp
+            if timestamp > 0:
+                descriptor.last_updated = timestamp
+        return descriptor
+
+    def _current_bar_index(self) -> int:
+        length = self.series.length()
+        return length - 1 if length > 0 else 0
+
+    def _resolve_retest_validity_bars(self, rule: ZoneTouchRule) -> int:
+        if rule.validity_bars is not None:
+            try:
+                return max(0, int(rule.validity_bars))
+            except (TypeError, ValueError):
+                return 0
+        try:
+            base = int(self.structure_settings.retests.validity_bars)
+        except (TypeError, ValueError):
+            base = 0
+        return max(0, base)
+
+    def _resolve_retest_validity_minutes(self, rule: ZoneTouchRule) -> Optional[int]:
+        if rule.validity_minutes is not None:
+            try:
+                return max(0, int(rule.validity_minutes))
+            except (TypeError, ValueError):
+                return 0
+        minutes = self.structure_settings.retests.validity_minutes
+        if minutes is None:
+            return None
+        try:
+            return max(0, int(minutes))
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_retest_window_bars(self, rule: ZoneTouchRule) -> int:
+        bars = self._resolve_retest_validity_bars(rule)
+        minutes = self._resolve_retest_validity_minutes(rule)
+        if minutes and minutes > 0:
+            bars_from_minutes = _resolve_recent_bar_lookback(
+                minutes,
+                self.base_timeframe,
+                self.base_tf_seconds,
+            )
+            bars = max(bars, bars_from_minutes)
+        return bars
+
+    def _resolve_price_tolerance(self, rule: ZoneTouchRule) -> float:
+        tick_multiple = _resolve_touch_tolerance(rule, self.structure_settings)
+        price_reference = abs(float(self.series.get("close"))) if self.series.length() > 0 else 0.0
+        base_step = self._min_price_step if self._min_price_step > 0 else max(price_reference * 1e-6, 1e-6)
+        if tick_multiple and tick_multiple > 0:
+            tolerance = base_step * float(tick_multiple)
+        else:
+            tolerance = base_step
+        return max(tolerance, 1e-8)
+
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
-        key: Optional[str] = None
-        if text == "IDM OB":
-            key = "IDM_OB"
-        elif text == "EXT OB":
-            key = "EXT_OB"
-        elif text == "Hist IDM OB":
-            key = "HIST_IDM_OB"
-        elif text == "Hist EXT OB":
-            key = "HIST_EXT_OB"
-        elif text == "Golden zone":
-            key = "GOLDEN_ZONE"
-        if key:
-            status_key = status or "active"
-            should_display = self._output_enabled_for(key) and self._box_status_enabled(status_key)
-            if isinstance(event_time, (int, float)):
-                ts_candidate: Optional[int] = int(event_time)
-            else:
-                ts_candidate = None
-                try:
-                    current_time = self.series.get_time()
-                except Exception:
-                    current_time = None
-                if isinstance(current_time, (int, float)) and int(current_time) > 0:
-                    ts_candidate = int(current_time)
-            if ts_candidate is None or ts_candidate <= 0:
-                if isinstance(box.left, (int, float)):
-                    ts_candidate = int(box.left)
-                else:
-                    try:
-                        ts_candidate = int(box.left)
-                    except Exception:
-                        ts_candidate = 0
-            ts = ts_candidate
-            status_label = self.BOX_STATUS_LABELS.get(status, status)
-            status_key = status if isinstance(status, str) and status else "active"
+        zone_key = normalize_zone_key(text)
+        status_key = status if isinstance(status, str) and status else "active"
+        timestamp = self._resolve_box_event_timestamp(box, event_time)
+        if zone_key and zone_key in STRUCTURE_RETRACEMENT_ZONE_KEYS:
+            descriptor = self._track_zone_descriptor(zone_key, box, status_key, timestamp)
+            should_display = self._output_enabled_for(zone_key) and self._box_status_enabled(status_key)
+            status_label = self.BOX_STATUS_LABELS.get(status_key, status_key)
             if should_display:
-                tally = self.console_box_status_tally[key]
+                tally = self.console_box_status_tally[zone_key]
                 tally[status_key] += 1
-                self.console_event_log[key] = {
-                    "text": box.text,
+                self.console_event_log[zone_key] = {
+                    "text": ZONE_DISPLAY_NAMES.get(zone_key, box.text),
                     "price": (box.bottom, box.top),
-                    "time": ts,
-                    "time_display": format_timestamp(ts),
-                    "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
-                    "status": status,
+                    "time": timestamp,
+                    "time_display": format_timestamp(timestamp),
+                    "display": f"{ZONE_DISPLAY_NAMES.get(zone_key, box.text)} {format_price(box.bottom)} → {format_price(box.top)}",
+                    "status": status_key,
                     "status_display": status_label,
                 }
                 self._trace(
                     "box",
                     "register",
                     timestamp=box.right,
-                    key=key,
+                    key=zone_key,
                     text=box.text,
                     top=box.top,
                     bottom=box.bottom,
-                    status=status,
+                    status=status_key,
                 )
             if status_key in ("touched", "retest"):
-                self._handle_choch_retracement_alert(key, status_key, ts, box)
-                self._handle_bos_retracement_alert(key, status_key, ts, box)
+                self._handle_structure_retracement_event("CHOCH", zone_key, status_key, timestamp, box, descriptor)
+                self._handle_structure_retracement_event("BOS", zone_key, status_key, timestamp, box, descriptor)
             if status_key == "new":
                 alert_titles = {
                     "IDM_OB": "IDM OB Zone Created",
                     "EXT_OB": "EXT OB Zone Created",
                     "GOLDEN_ZONE": "Golden Zone Created",
                 }
-                alert_title = alert_titles.get(key)
+                alert_title = alert_titles.get(zone_key)
                 if alert_title:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
+                    message = f"{{ticker}} {ZONE_DISPLAY_NAMES.get(zone_key, box.text)} Created, Range: {price_range}"
                     self.alertcondition(True, alert_title, message)
+
+    def _handle_structure_retracement_event(
+        self,
+        break_type: str,
+        zone_key: str,
+        status: str,
+        timestamp: int,
+        box: Box,
+        descriptor: ZoneDescriptor,
+    ) -> bool:
+        event = self._evaluate_structure_retracement(break_type, zone_key, status, timestamp, box, descriptor)
+        if not event:
+            return False
+        self._emit_structure_retracement_alert(event, box)
+        return True
+
+    def _evaluate_structure_retracement(
+        self,
+        break_type: str,
+        zone_key: str,
+        status: str,
+        timestamp: int,
+        box: Box,
+        descriptor: ZoneDescriptor,
+    ) -> Optional[StructureRetestEvent]:
+        break_type_upper = break_type.upper()
+        if break_type_upper not in ("CHOCH", "BOS"):
+            return None
+        settings = self.structure_settings
+        zone_rule = settings.zones.get(zone_key)
+        if zone_rule is None or not zone_rule.enabled:
+            return None
+
+        if break_type_upper == "CHOCH":
+            break_timestamp = self._last_choch_timestamp
+            direction = self._last_choch_direction or ""
+            break_price = self._last_choch_price
+            state_dict = self._retest_states["CHOCH"]
+            alert_index = self._retest_alert_index["CHOCH"]
+        else:
+            break_timestamp = self._last_bos_timestamp
+            direction = self._last_bos_direction or ""
+            break_price = self._last_bos_price
+            state_dict = self._retest_states["BOS"]
+            alert_index = self._retest_alert_index["BOS"]
+
+        if break_timestamp is None or break_price is None:
+            return None
+        if timestamp < break_timestamp:
+            return None
+        if direction not in ("bullish", "bearish"):
+            return None
+        if not self._structure_retracement_within_recent(break_timestamp):
+            return None
+        if not self._structure_retracement_within_recent(timestamp):
+            return None
+
+        window_bars = self._resolve_retest_window_bars(zone_rule)
+        bars_since_break = self._bars_ago_from_time(break_timestamp)
+        if window_bars > 0 and bars_since_break is not None and bars_since_break > window_bars:
+            return None
+
+        tolerance = self._resolve_price_tolerance(zone_rule)
+        if not zone_matches_direction(direction, break_price, box, tol=tolerance):
+            return None
+
+        high = self.series.get("high")
+        low = self.series.get("low")
+        open_ = self.series.get("open")
+        close = self.series.get("close")
+        try:
+            h_val = float(high)
+            l_val = float(low)
+            o_val = float(open_)
+            c_val = float(close)
+        except (TypeError, ValueError):
+            return None
+
+        if zone_rule.use_wicks:
+            if h_val < float(box.bottom) - tolerance or l_val > float(box.top) + tolerance:
+                return None
+        else:
+            body_high = max(o_val, c_val)
+            body_low = min(o_val, c_val)
+            if body_high < float(box.bottom) - tolerance or body_low > float(box.top) + tolerance:
+                return None
+
+        state_key = f"{descriptor.zone_id}@{int(break_timestamp)}"
+        progress = state_dict.get(state_key)
+        if progress is None:
+            progress = ZoneRetestProgress(
+                zone_id=descriptor.zone_id,
+                zone_key=zone_key,
+                break_type=break_type_upper,
+                break_timestamp=int(break_timestamp),
+                break_price=float(break_price),
+                direction=direction,
+                created_at=descriptor.created_at,
+            )
+            state_dict[state_key] = progress
+
+        max_allowed = zone_rule.max_retests if zone_rule.max_retests is not None else 0
+        if zone_rule.first_touch_only and progress.touches >= 1:
+            return None
+        if not zone_rule.first_touch_only and max_allowed > 0 and progress.touches >= max_allowed:
+            return None
+
+        dedupe_window = max(0, int(settings.alerts.dedupe_window_bars))
+        current_index = self._current_bar_index()
+        last_index = alert_index.get(state_key)
+        if dedupe_window > 0 and last_index is not None and (current_index - last_index) <= dedupe_window:
+            return None
+
+        bars_since_break_display = bars_since_break if bars_since_break is not None else 0
+
+        progress.touches += 1
+        progress.notified = True
+        progress.last_touch_timestamp = timestamp
+        progress.last_touch_bar_index = current_index
+        alert_index[state_key] = current_index
+
+        direction_text = "صاعد" if direction == "bullish" else "هابط"
+        event = StructureRetestEvent(
+            progress=progress,
+            status=status,
+            timestamp=timestamp,
+            direction_text=direction_text,
+            zone_display=ZONE_DISPLAY_NAMES.get(zone_key, box.text),
+            bars_since_break=bars_since_break_display,
+        )
+        return event
+
+    def _emit_structure_retracement_alert(self, event: StructureRetestEvent, box: Box) -> None:
+        progress = event.progress
+        status_label = self.BOX_STATUS_LABELS.get(event.status, event.status)
+        zone_label = ZONE_DISPLAY_NAMES.get(progress.zone_key, box.text)
+        bars_window = int(event.bars_since_break) if isinstance(event.bars_since_break, (int, float)) else 0
+        break_price_fmt = format_price(progress.break_price)
+        break_time_fmt = format_timestamp(progress.break_timestamp)
+        zone_type = zone_label
+        context = f"رمز: {{ticker}} | فريم: {self.base_timeframe or 'غير محدد'} | وقت الكسر: {break_time_fmt}"
+        message = (
+            f"{progress.break_type} {event.direction_text} عند {break_price_fmt}. "
+            f"تصحيح إلى {zone_label} [{zone_type}] ضمن الصلاحية ({bars_window} شمعة). "
+            f"الحالة: {status_label}. {context}"
+        )
+        title = f"{progress.break_type} Retracement → {zone_label}"
+        self.alertcondition(True, title, message)
+        self._update_structure_retracement_console(
+            progress.break_type,
+            progress.zone_key,
+            event.status,
+            event.timestamp,
+            box,
+            event.direction_text,
+            progress.break_price,
+            progress.break_timestamp,
+        )
 
     def _handle_choch_retracement_alert(
         self,
@@ -2118,52 +2607,11 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         if not OUTPUT_SETTINGS.enable_choch_retracement_alerts:
             return
-        if self._last_choch_timestamp is None:
-            return
-        if timestamp < self._last_choch_timestamp:
-            return
-        if not self._structure_retracement_within_recent(self._last_choch_timestamp):
-            return
-        if not self._structure_retracement_within_recent(timestamp):
-            return
         if zone_key not in STRUCTURE_RETRACEMENT_ZONE_KEYS:
             return
-        zone_identifier = f"{zone_key}:{id(box)}"
-        if zone_identifier in self._choch_alerted_zone_ids:
-            return
-        self._choch_alerted_zone_ids.add(zone_identifier)
-        direction = self._last_choch_direction or "neutral"
-        direction_text = "صاعد" if direction == "bullish" else "هابط" if direction == "bearish" else "محايد"
-        if not self._structure_retracement_zone_matches_direction(direction, self._last_choch_price, box):
-            return
-        zone_display_map = {
-            "IDM_OB": "IDM OB",
-            "EXT_OB": "EXT OB",
-            "HIST_IDM_OB": "Hist IDM OB",
-            "HIST_EXT_OB": "Hist EXT OB",
-            "GOLDEN_ZONE": "Golden zone",
-        }
-        zone_display = zone_display_map.get(zone_key, box.text)
-        price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-        choch_time = format_timestamp(self._last_choch_timestamp)
-        choch_price = format_price(self._last_choch_price)
-        title = f"CHOCH Retracement → {zone_display}"
-        message = (
-            f"{{ticker}} تصحيح CHOCH {direction_text} إلى {zone_display}. "
-            f"الحالة: {self.BOX_STATUS_LABELS.get(status, status)}. "
-            f"النطاق: {price_range}. سعر CHOCH: {choch_price}. وقت CHOCH: {choch_time}"
-        )
-        self.alertcondition(True, title, message)
-        self._update_structure_retracement_console(
-            "CHOCH",
-            zone_key,
-            status,
-            timestamp,
-            box,
-            direction_text,
-            self._last_choch_price,
-            self._last_choch_timestamp,
-        )
+        status_key = status if isinstance(status, str) and status else "active"
+        descriptor = self._track_zone_descriptor(zone_key, box, status_key, timestamp)
+        self._handle_structure_retracement_event("CHOCH", zone_key, status_key, timestamp, box, descriptor)
 
     def _handle_bos_retracement_alert(
         self,
@@ -2174,52 +2622,11 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         if not OUTPUT_SETTINGS.enable_bos_retracement_alerts:
             return
-        if self._last_bos_timestamp is None:
-            return
-        if timestamp < self._last_bos_timestamp:
-            return
-        if not self._structure_retracement_within_recent(self._last_bos_timestamp):
-            return
-        if not self._structure_retracement_within_recent(timestamp):
-            return
         if zone_key not in STRUCTURE_RETRACEMENT_ZONE_KEYS:
             return
-        zone_identifier = f"{zone_key}:{id(box)}"
-        if zone_identifier in self._bos_alerted_zone_ids:
-            return
-        self._bos_alerted_zone_ids.add(zone_identifier)
-        direction = self._last_bos_direction or "neutral"
-        direction_text = "صاعد" if direction == "bullish" else "هابط" if direction == "bearish" else "محايد"
-        if not self._structure_retracement_zone_matches_direction(direction, self._last_bos_price, box):
-            return
-        zone_display_map = {
-            "IDM_OB": "IDM OB",
-            "EXT_OB": "EXT OB",
-            "HIST_IDM_OB": "Hist IDM OB",
-            "HIST_EXT_OB": "Hist EXT OB",
-            "GOLDEN_ZONE": "Golden zone",
-        }
-        zone_display = zone_display_map.get(zone_key, box.text)
-        price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-        bos_time = format_timestamp(self._last_bos_timestamp)
-        bos_price = format_price(self._last_bos_price)
-        title = f"BOS Retracement → {zone_display}"
-        message = (
-            f"{{ticker}} تصحيح BOS {direction_text} إلى {zone_display}. "
-            f"الحالة: {self.BOX_STATUS_LABELS.get(status, status)}. "
-            f"النطاق: {price_range}. سعر BOS: {bos_price}. وقت BOS: {bos_time}"
-        )
-        self.alertcondition(True, title, message)
-        self._update_structure_retracement_console(
-            "BOS",
-            zone_key,
-            status,
-            timestamp,
-            box,
-            direction_text,
-            self._last_bos_price,
-            self._last_bos_timestamp,
-        )
+        status_key = status if isinstance(status, str) and status else "active"
+        descriptor = self._track_zone_descriptor(zone_key, box, status_key, timestamp)
+        self._handle_structure_retracement_event("BOS", zone_key, status_key, timestamp, box, descriptor)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -7280,6 +7687,8 @@ class SmartMoneyAlgoProE5:
         open_ = self.series.get("open")
         time_val = self.series.get_time()
         volume = self.series.get("volume")
+
+        self._update_displacement_metrics(open_, high, low, close)
 
         self._trace(
             "update_bar",
